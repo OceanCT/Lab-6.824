@@ -22,6 +22,26 @@ type ExampleReply struct {
 	Y int
 }
 
+
+type TaskType int
+const (
+    MapTask     TaskType = 0
+    ReduceTask  TaskType = 1
+)
+
+
+
+type Task struct {
+    taskId      int
+    taskType    TaskType
+}
+
+type GetTaskReq struct {
+    workerState bool
+    task        *Task
+}
+
+
 // Add your RPC definitions here.
 
 

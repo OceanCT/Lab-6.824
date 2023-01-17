@@ -1,10 +1,12 @@
 package mr
 
-import "fmt"
-import "log"
-import "net/rpc"
-import "hash/fnv"
-
+import (
+	"fmt"
+	"hash/fnv"
+	"log"
+	"net/rpc"
+	"time"
+)
 
 //
 // Map functions return a slice of KeyValue.
@@ -30,13 +32,61 @@ func ihash(key string) int {
 //
 func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
-
 	// Your worker implementation here.
+    workerId := -1
+    done := false
+    var getWorkerIdDuration time.Duration
+    for !done {
+        if workerId == -1 {
+            workerId = GetWorkerID(getWorkerIdDuration)
+        } else {
 
-	// uncomment to send the Example RPC to the coordinator.
-	// CallExample()
+            flag,task := CallPullTask(workerId)
+            if flag == -1 {
+                workerId = -1
+            } else if flag == 0 {
+                done = true
+            } else if task.taskType == MapTask{
+            
+            } else if task.taskType == ReduceTask {
+
+            }
+        }   
+    } 
 
 }
+// this function gets a worker id from the coordinator
+func GetWorkerID(duration time.Duration) int {
+    var args    int
+    var workerId int
+    ok := false 
+    for !ok {
+        ok = call("Coordinator.RegisterWorker", &args, &workerId)
+        time.Sleep(duration)
+    }
+    return workerId
+}
+
+//
+// The function pulls task from the coordinator
+// return 1 if there exist a task needed to be done
+// return 0 if everything is over
+// return -1 if the workerId is no long valid
+func CallPullTask(workerId int) (flag int, task *Task) {
+    getTaskReq := GetTaskReq {}
+    ok := false
+    for !ok {
+        ok = call("Coordinator.PullTask", workerId, &getTaskReq)
+    }
+    if !getTaskReq.workerState {
+        return -1, nil
+    } else if getTaskReq.task == nil{
+        return 0, nil
+    } else {
+        return 1, getTaskReq.task
+    }
+}
+
 
 //
 // example function to show how to make an RPC call to the coordinator.
