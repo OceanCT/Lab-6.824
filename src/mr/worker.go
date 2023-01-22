@@ -1,98 +1,167 @@
 package mr
 
 import (
+	"encoding/json"
 	"fmt"
 	"hash/fnv"
+	"io/ioutil"
 	"log"
 	"net/rpc"
-	"time"
+	"os"
+	"strings"
 )
 
-//
 // Map functions return a slice of KeyValue.
-//
 type KeyValue struct {
 	Key   string
 	Value string
 }
 
-//
 // use ihash(key) % NReduce to choose the reduce
-// task number for each KeyValue emitted by Map.
-//
+// Task number for each KeyValue emitted by Map.
 func ihash(key string) int {
 	h := fnv.New32a()
 	h.Write([]byte(key))
 	return int(h.Sum32() & 0x7fffffff)
 }
 
+type worker struct {
+	workerId int
+	mapf     func(string, string) []KeyValue
+	reducef  func(string, []string) string
+}
 
-//
 // main/mrworker.go calls this function.
-//
 func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
 	// Your worker implementation here.
-    workerId := -1
-    done := false
-    var getWorkerIdDuration time.Duration
-    for !done {
-        if workerId == -1 {
-            workerId = GetWorkerID(getWorkerIdDuration)
-        } else {
-
-            flag,task := CallPullTask(workerId)
-            if flag == -1 {
-                workerId = -1
-            } else if flag == 0 {
-                done = true
-            } else if task.taskType == MapTask{
-            
-            } else if task.taskType == ReduceTask {
-
-            }
-        }   
-    } 
-
+	w := &worker{
+		workerId: getWorkerId(),
+		mapf:     mapf,
+		reducef:  reducef,
+	}
+	if w.workerId != -1 {
+		DPrintf("worker:%d started", w.workerId)
+		w.run()
+	}
 }
+
 // this function gets a worker id from the coordinator
-func GetWorkerID(duration time.Duration) int {
-    var args    int
-    var workerId int
-    ok := false 
-    for !ok {
-        ok = call("Coordinator.RegisterWorker", &args, &workerId)
-        time.Sleep(duration)
-    }
-    return workerId
+func getWorkerId() int {
+	args := RegisterWorkerArgs{}
+	reply := RegisterWorkerReply{}
+	if ok := call("Coordinator.RegisterWorker", args, &reply); !ok {
+		DPrintf("Fatal: worker failed to register")
+		return -1
+	}
+	return reply.WorkerId
 }
 
-//
-// The function pulls task from the coordinator
-// return 1 if there exist a task needed to be done
-// return 0 if everything is over
-// return -1 if the workerId is no long valid
-func CallPullTask(workerId int) (flag int, task *Task) {
-    getTaskReq := GetTaskReq {}
-    ok := false
-    for !ok {
-        ok = call("Coordinator.PullTask", workerId, &getTaskReq)
-    }
-    if !getTaskReq.workerState {
-        return -1, nil
-    } else if getTaskReq.task == nil{
-        return 0, nil
-    } else {
-        return 1, getTaskReq.task
-    }
+func (w *worker) pullTask() (Task, bool) {
+	args := PullTaskArgs{
+		WorkerId: w.workerId,
+	}
+	reply := PullTaskReply{}
+	if ok := call("Coordinator.PullTask", args, &reply); !ok {
+		DPrintf("worker fail to pull task")
+		os.Exit(1)
+	}
+	return reply.Task, reply.Done
 }
 
+func (w *worker) reportTask(task Task, done bool) {
+	args := ReportTaskArgs{
+		WorkerId: w.workerId,
+		Done:     done,
+		TaskType: task.TaskType,
+		TaskId:   task.TaskId,
+	}
+	reply := ReportTaskReply{}
+	if ok := call("Coordinator.ReportTask", args, &reply); !ok {
+		DPrintf("report Task fail:%+v", args)
+	}
+}
 
-//
+func (w *worker) doMapTask(t Task) {
+    // fmt.Printf("doing MapTask: %d\n", t.TaskId)
+    if contents, err := ioutil.ReadFile(t.InputFileName); err != nil {
+		w.reportTask(t, false)
+	} else {
+		mapRes := w.mapf(t.InputFileName, string(contents))
+		dividedMapResult := make([][]KeyValue, t.NReduce)
+		for _, kv := range mapRes {
+			reduceId := ihash(kv.Key) % t.NReduce
+			dividedMapResult[reduceId] = append(dividedMapResult[reduceId], kv)
+		}
+		for reduceId, result := range dividedMapResult {
+			fileName := getReduceName(t.TaskId, reduceId)
+			f, err := os.Create(fileName)
+			if err != nil {
+				w.reportTask(t, false)
+				return
+			}
+			enc := json.NewEncoder(f)
+			for _, kv := range result {
+				if err := enc.Encode(&kv); err != nil {
+					w.reportTask(t, false)
+                    return
+				}
+			}
+			if err := f.Close(); err != nil {
+				w.reportTask(t, false)
+				return
+			}
+		}
+	}
+	w.reportTask(t, true)
+}
+
+func (w *worker) doReduceTask(t Task) {
+	mapResult := make(map[string][]string)
+	for mapId := 0; mapId < t.NMap; mapId++ {
+		fileName := getReduceName(mapId, t.TaskId)
+		file, err := os.Open(fileName)
+		if err != nil {
+			w.reportTask(t, false)
+			return
+		}
+		dec := json.NewDecoder(file)
+		for true {
+			var kv KeyValue
+			if err := dec.Decode(&kv); err != nil {
+				break
+			}
+			mapResult[kv.Key] = append(mapResult[kv.Key], kv.Value)
+		}
+	}
+	res := make([]string, len(mapResult))
+	for k, v := range mapResult {
+		res = append(res, fmt.Sprintf("%v %v\n", k, w.reducef(k, v)))
+	}
+	if err := ioutil.WriteFile(getResultName(t.TaskId), []byte(strings.Join(res, "")), 0600); err != nil {
+		w.reportTask(t, false)
+	} else {
+		w.reportTask(t, true)
+	}
+}
+
+func (w *worker) run() {
+	for {
+		t, done := w.pullTask()
+		if done {
+			break
+		}
+		if t.TaskType == MapTask {
+			w.doMapTask(t)
+		} else {
+			w.doReduceTask(t)
+		}
+	}
+}
+
 // example function to show how to make an RPC call to the coordinator.
 //
 // the RPC argument and reply types are defined in rpc.go.
-//
 func CallExample() {
 
 	// declare an argument structure.
@@ -117,11 +186,9 @@ func CallExample() {
 	}
 }
 
-//
 // send an RPC request to the coordinator, wait for the response.
 // usually returns true.
 // returns false if something goes wrong.
-//
 func call(rpcname string, args interface{}, reply interface{}) bool {
 	// c, err := rpc.DialHTTP("tcp", "127.0.0.1"+":1234")
 	sockname := coordinatorSock()
