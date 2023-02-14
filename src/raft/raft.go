@@ -40,16 +40,18 @@ const (
     Leader      Role = 2
 )
 type Log struct {
-    Command     string
+    Command     interface{}
     Term        int
 }
 const (
     ElectionTimeout = time.Millisecond * 1000
-    IdleTimeout = time.Millisecond * 300
-    // to avoid disconnected leader ask for resources too often
+    IdleTimeout = time.Millisecond * 500
+    // to avoid disconnected leader to ask for resources too often
     DisConnectTimeOut = time.Millisecond * 500
     // to solve distributed deadlocks
     MaxRpcTime = time.Millisecond * 100
+    // to prevent a func from asking locks too often
+    FuncBlockTime = time.Millisecond * 50
 )
 
 
@@ -109,16 +111,18 @@ type Raft struct {
     startLeaderChannel  chan int
     leaderOnly  *LeaderOnlyInfo
 
+    // which server it assumes is leader now
+    assumeLeader    int
     // for debug 
     lockBelong  string
 }
 
-func (rf *Raft) getRoleName() string {
-    if rf.role == Leader {
+func (rf *Raft) getRoleName(role Role) string {
+    if role == Leader {
         return "Leader"
-    } else if rf.role == Follower {
+    } else if role == Follower {
         return "Follower"
-    } else if rf.role == Candidate {
+    } else if role == Candidate {
         return "Candidate"
     } else {
         return ""
@@ -127,32 +131,22 @@ func (rf *Raft) getRoleName() string {
 
 func (rf *Raft) name() string {
     return "Server$" + strconv.FormatInt(int64(rf.me), 10) + "(Term: "+ strconv.FormatInt(int64(rf.currentTerm), 10) + 
-    ", Role: "+ rf.getRoleName() +",)"
+    ", Role: "+ rf.getRoleName(rf.role) +",)"
 }
 
-func (rf *Raft) lock(info string) {
+func (rf *Raft) lock(format string, info ...interface{}) {
     rf.mu.Lock()
-    DPrintf(rf.name() + " Lock " + info)
+    DPrintf(rf.name() + " Lock " + format, info...)
 }
 
-func (rf *Raft) rLock(info string) {
-    rf.mu.RLock()
-    DPrintf(rf.name() + " Rlock " + info)
+func (rf *Raft) unlock(format string, info ...interface{}) {
+    rf.mu.Unlock()
+    DPrintf(rf.name() + " UnLock " + format, info...)
 }
 
-func (rf *Raft) unlock(info string) {
-    name := rf.name()
-    rf.mu.Unlock() 
-    DPrintf(name + " Unlock " + info)
-}
-func (rf *Raft) rUnlock(info string) {
-    name := rf.name()
-    rf.mu.RUnlock()
-    DPrintf(name + " RUnlcok " + info)
-}
 
-func (rf *Raft) dPrint(info string) {
-    DPrintf(rf.name() + " " + info)
+func (rf *Raft) dPrintf(format string, info ...interface{}) {
+    DPrintf(rf.name() + " " + format, info...)
 }
 
 
@@ -262,6 +256,7 @@ type AppendEntriesArgs struct {
     LeaderId        int
     PrevLogIndex    int
     PrevLogTerm     int
+    LastLogTerm     int
     Entries         []Log
     LeaderCommit    int
 }
@@ -315,18 +310,35 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-    rf.lock("AppendEntries")
+    rf.lock("AppendEntries from Server$%d", args.LeaderId)
     rf.lockBelong = "AppendEntries"
-    defer rf.unlock("AppendEntries")
+    defer rf.unlock("AppendEntries from Server$%d", args.LeaderId)
+    rf.dPrintf("AppendEntriesArgs: %+v", *args) 
     rf.electionTimeReset = true
     reply.Term = rf.currentTerm
-    if args.LeaderTerm < rf.currentTerm {
+    checkCommit := func() {
+        if args.LeaderCommit > rf.commitIndex {
+            if args.LeaderCommit > args.PrevLogIndex {
+                rf.commitIndex = args.PrevLogIndex
+            } else {
+                rf.commitIndex = args.LeaderCommit    
+            }
+        }
+    }
+    if args.LeaderTerm < rf.currentTerm || args. LastLogTerm < rf.lastLogTerm() {
         reply.Success = false
-    } else if args.PrevLogIndex == -1 {
+    } else if len(args.Entries) == 0 {
+        // this is heartbeat sent by leader
         reply.Success = true
         if rf.role == Candidate {
             rf.convertRole(Follower)
         }
+        rf.assumeLeader = args.LeaderId
+        checkCommit()
+    } else if args.PrevLogIndex == -1 {
+        reply.Success = true
+        rf.log = args.Entries
+        checkCommit()
     } else {
         if len(rf.log) < args.PrevLogIndex + 1 {
             reply.Success = false
@@ -335,13 +347,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
         } else {
             reply.Success = true
             rf.log = append(rf.log[0: args.PrevLogIndex + 1], args.Entries...)
-            if args.LeaderCommit > rf.commitIndex {
-                if args.LeaderCommit > len(rf.log) - 1 {
-                    rf.commitIndex = len(rf.log) - 1
-                } else {
-                    rf.commitIndex = args.LeaderCommit    
-                }
-            }
+            checkCommit()
         }
     }
     if args.LeaderTerm > rf.currentTerm {
@@ -357,7 +363,7 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
     }()
     select {
     case <- time.After(MaxRpcTime):
-        DPrintf("AppendEntries timeout")
+        DPrintf("AppendEntries timeout from Server$%d to Server$%d", rf.me, server)
         return false
     case <- ch:
         return true
@@ -412,15 +418,14 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 
 
 
-// the initialization of server after changing its role
+// the initialization of a server after changing its role
 func (rf *Raft) convertRole(role Role) {
-    var roleName string
-    if role == Leader { roleName = "Leader" } else if role == Candidate { roleName = "Candidate" } else if role == Follower { roleName = "Follower" }
-    rf.dPrint("convert to " + roleName)
+    rf.dPrintf("convert to " + rf.getRoleName(role))
     if role == Candidate {
         rf.currentTerm++
         rf.votedFor = rf.me
         rf.startElectionChannel <- 1
+        rf.assumeLeader = -1
     } else if role == Leader {
         rf.leaderOnly = &LeaderOnlyInfo {
             nextIndex: make([]int, len(rf.peers), len(rf.peers)),
@@ -430,14 +435,15 @@ func (rf *Raft) convertRole(role Role) {
         for index := range rf.leaderOnly.matchIndex {
             rf.leaderOnly.matchIndex[index] = -1
         }
+        rf.assumeLeader = rf.me
         rf.startLeaderChannel <- 1
     } else if role == Follower {
         rf.votedFor = -1
+        rf.assumeLeader = -1
     }
     rf.electionTimeReset = true
     rf.role = role
 }
-
 
 
 
@@ -457,16 +463,24 @@ func (rf *Raft) convertRole(role Role) {
 // term. the third return value is true if this server believes it is
 // the leader.
 //
-func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := true
-
+func (rf *Raft) Start(command interface{}) (index int, term int, isLeader bool) {
 	// Your code here (2B).
-
-
-	return index, term, isLeader
+    rf.lock("Receive command")
+    defer rf.unlock("Receive command")
+    index = rf.lastLogIndex() + 1
+    term = rf.currentTerm
+    isLeader = rf.role == Leader
+    if isLeader {
+        rf.log = append(rf.log, Log{
+            Command: command,
+            Term: rf.currentTerm,
+        })
+        rf.dPrintf("Receive command, log changes to: %+v", rf.log)
+        rf.leaderOnly.matchIndex[rf.me] = index
+    }
+    return index + 1, term, isLeader 
 }
+
 
 
 //
@@ -521,9 +535,8 @@ func (rf *Raft) getRole() Role {
     return rf.role
 }
 
-// TODO::
 func (rf *Raft) tryGetVote(serverIndex int) bool {
-    rf.lock("tryGetVote from " + strconv.FormatInt(int64(serverIndex), 10))
+    rf.lock("tryGetVote from Server$%d", serverIndex)
     rf.lockBelong = "tryGetVote"
     defer rf.unlock("tryGetVote")
     reply := &RequestVoteReply {}
@@ -561,76 +574,82 @@ func (rf *Raft) elect() {
 // leaderOnly function
 func (rf *Raft) checkCommitIndex() {
     for rf.getRole() == Leader {
-        rf.lock("check commitIndex")
+        rf.mu.Lock()
+        // rf.lock("check commitIndex")
         newCommitIndex := rf.commitIndex + 1
         num := 1
         for index, match := range rf.leaderOnly.matchIndex {
             if index == rf.me { continue }
             if newCommitIndex <= match { num++ }
         }
-        if num >= len(rf.peers) / 2 {
+        if num >= (len(rf.peers) + 1) / 2 {
             rf.commitIndex = newCommitIndex
         }
-        rf.unlock("check commitIndex")
+        rf.mu.Unlock()
+        // rf.unlock("check commitIndex")
+        time.Sleep(FuncBlockTime) 
     }    
 }
 
 
-func (rf *Raft) generateAppendEntriesArgs(prevLogIndex int) *AppendEntriesArgs {
+func (rf *Raft) generateAppendEntriesArgs(prevLogIndex int, empty bool) *AppendEntriesArgs {
     res := &AppendEntriesArgs {
         LeaderTerm: rf.currentTerm,
         LeaderId: rf.me,
         PrevLogIndex: prevLogIndex,
-        // PrevLogTerm: rf.log[prevLogIndex].Term,
-        Entries: rf.log[prevLogIndex + 1:],
         LeaderCommit: rf.commitIndex,
+        LastLogTerm: rf.lastLogTerm(),
     }
     if prevLogIndex != -1 {
         res.PrevLogTerm = rf.log[prevLogIndex].Term
     } else {
         res.PrevLogTerm = -1
     }
+    if !empty {
+        res.Entries = rf.log[prevLogIndex + 1:]
+    }
     return res
 }
 
 // send idle appendEntries to establish leader position
 func (rf *Raft) establishLeaderPosition() {
-    rf.dPrint("try to establish leader position")
+    rf.dPrintf("try to establish leader position")
     for serverIndex := range rf.peers {
         if serverIndex == rf.me { continue }
         go func(server int) {
             for !rf.killed() && rf.getRole() == Leader {
                 reply := &AppendEntriesReply{}
                 disconnect := false
-                rf.lock("Null AppendEntries To Server$" + strconv.FormatInt(int64(server), 10)) 
+                rf.mu.Lock()
                 rf.lockBelong = "NullAppendEntries"
                 if rf.role == Leader {
-                    args := rf.generateAppendEntriesArgs(-1)
+                    args := rf.generateAppendEntriesArgs(rf.leaderOnly.matchIndex[server], true)
                     disconnect = rf.sendAppendEntries(server, args, reply)
                     if reply.Term > rf.currentTerm {
                         rf.currentTerm = reply.Term
                         rf.convertRole(Follower)
                     }
                 }
-                rf.unlock("Null AppendEntries")
+                rf.mu.Unlock()
                 if disconnect {
                     time.Sleep(DisConnectTimeOut)
                 } else {
                     time.Sleep(IdleTimeout)
                 }
             }
-        }(serverIndex)
+        }(serverIndex) 
     }
 }
 
 // leader appends follower entries
 func (rf *Raft) appendFollowerEntries() {
     for serverIndex := range rf.peers {
+        if serverIndex == rf.me { continue }
         go func(server int) {
             for rf.getRole() == Leader {
-                rf.lock("appendFollowerEntries" + strconv.FormatInt(int64(server), 10))
-                if len(rf.log) - 1 >= rf.leaderOnly.nextIndex[server] {       
-                    args := rf.generateAppendEntriesArgs(rf.leaderOnly.nextIndex[server] - 1)
+                rf.mu.Lock()
+                if rf.lastLogIndex() >= rf.leaderOnly.nextIndex[server] {    
+                    args := rf.generateAppendEntriesArgs(rf.leaderOnly.nextIndex[server] - 1, false)
                     reply := &AppendEntriesReply{}
                     rf.sendAppendEntries(server, args, reply)
                     if reply.Success{
@@ -638,7 +657,8 @@ func (rf *Raft) appendFollowerEntries() {
                         rf.leaderOnly.matchIndex[server] = len(rf.log) - 1
                     }
                 }
-                rf.unlock("appendFollowerEntries")
+                rf.mu.Unlock()
+                time.Sleep(FuncBlockTime)
             }
         }(serverIndex)
     }
@@ -663,13 +683,12 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
-    // rand.Seed(time.Now().UnixNano())
     rf.currentTerm = 0
     rf.votedFor = -1
     rf.role = Follower
     rf.log = make([]Log, 0, 0)
-    rf.commitIndex = 0
-    rf.lastApplied = 0
+    rf.commitIndex = -1 
+    rf.lastApplied = -1
     rf.electionTimeReset = false
     rf.startElectionChannel = make(chan int)
     rf.stopElectionChannel = make(chan int)
@@ -694,6 +713,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
             rf.unlock("ElectionTimeout")
         }
     }()
+
     // candidate try to become leader
     go func() {
         for !rf.killed() {
@@ -705,6 +725,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
             }
         }       
     }()
+
     // waiting to become leader
     go func() {
         for !rf.killed() {
@@ -712,26 +733,31 @@ func Make(peers []*labrpc.ClientEnd, me int,
             case <- rf.stopLeaderChannel:
                 return
             case <- rf.startLeaderChannel:
-//                go rf.checkCommitIndex()
+                go rf.checkCommitIndex()
                 go rf.establishLeaderPosition()
-//                go rf.appendFollowerEntries()
+                go rf.appendFollowerEntries()
             }
         }
     }()
-    // if commitIndex > lastApplied apply log[lastApplied]
-    /*
+    
+    // if commitIndex > lastApplied apply log[lastApplied + 1]
+    // Add one applyMsg to applyCh because stupid test
     go func() {
         for !rf.killed() {
             rf.mu.Lock()
-            // rf.lock("check if logs can be applied")
-            if rf.commitIndex > rf.lastApplied {
-                // rf.apply(rf.log[rf.lastApplied])
+            for rf.commitIndex > rf.lastApplied {
                 rf.lastApplied++
+                msg := ApplyMsg{
+                    CommandValid: true,
+                    Command: rf.log[rf.lastApplied].Command,
+                    CommandIndex: rf.lastApplied + 1,
+                }
+                applyCh <- msg
+                rf.dPrintf("Applying Message: %+v", msg)
             } 
             rf.mu.Unlock()
-            // rf.unlock("check if logs can be applied")
+            time.Sleep(FuncBlockTime)
         }
     }()
-    */
 	return rf
 }
